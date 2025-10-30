@@ -882,71 +882,57 @@ async function validateWithExaIncludeText(event, monthName, day, maxRetries = 3)
   console.log(`\n      🔍 TIER 3: Exa include_text Validation`);
   console.log(`         Event: ${event.title}`);
   console.log(`         Date: ${monthName} ${parseInt(day)}, ${event.year}`);
-  
+
   const keywords = event.keywords || [];
-  const titleWords = event.title.split(' ').filter(w => w.length > 3).slice(0, 5);
+  const titleWords = event.title.split(" ").filter((w) => w.length > 3).slice(0, 5);
   const allKeywords = [...keywords, ...titleWords];
-  const query = allKeywords.slice(0, 5).join(' ');
-  
+  const query = allKeywords.slice(0, 5).join(" ");
+
   const dateStrings = getMultilingualDateStrings(monthName, day);
   console.log(`         🌐 Multilingual date filters: ${dateStrings.length} variants`);
-  if (DEBUG) console.log(`         📋 Sample filters: ${dateStrings.slice(0, 5).join(', ')}...`);
-  
   console.log(`         🔎 Query: "${query}"`);
-  
-  let lastError = null;
-  
+
+  METRICS.validation.tier3++;
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      console.log(`         🔄 Attempt ${attempt + 1}/${maxRetries}`);
-      
-      const results = await exaSearch(query, { 
-        numResults: 20,
-        includeText: dateStrings,
-        includeTextContent: true
+      const results = await exaSearch(query, {
+        numResults: 15,
+        includeText: true,
       });
-      
-      console.log(`         📊 Results: ${results.length}`);
-      
-      if (results.length === 0) {
+      const checkedResults = applyUniversalSourceCheck(event, results);
+
+      if (!checkedResults || checkedResults.length === 0) {
         if (attempt < maxRetries - 1) {
-          console.log(`         ⚠️ No results, retrying...`);
+          console.log(`         ⚠️ No results from Exa, retrying...`);
           METRICS.validation.tier3_retries++;
           await sleep(1000);
           continue;
         } else {
           console.log(`         ❌ No results after ${maxRetries} attempts - REJECTED`);
           METRICS.validation.tier3_fail++;
-          return { validated: false, results: [], reason: 'exa-no-results' };
+          return { validated: false, results: [], reason: "exa-no-results" };
         }
       }
-      
-      console.log(`         ✅ Step 1: Found ${results.length} results with date filter`);
-      
-      const qualityScore = calculateDomainQuality(results);
+
+      const qualityScore = calculateDomainQuality(checkedResults);
       console.log(`         📊 Domain Quality Score: ${qualityScore.score} points`);
-      console.log(`         🏆 High-Trust: ${qualityScore.highTrust} | 📜 Historical: ${qualityScore.historical}`);
-      
-      if (results.length >= 5 && qualityScore.score >= 3) {
-        console.log(`         ✅✅ STRONG SIGNAL - ${results.length} results + good domains!`);
+
+      if (checkedResults.length >= 5 && qualityScore.score >= 3) {
         METRICS.validation.tier3_success++;
-        return { validated: true, results, reason: 'exa-strong-signal' };
+        return { validated: true, results: checkedResults, reason: "exa-strong-signal" };
       }
-      
-      if (results.length >= 3 && qualityScore.highTrust > 0) {
-        console.log(`         ✅ GOOD SIGNAL - high-trust domain present`);
+
+      if (checkedResults.length >= 3 && qualityScore.highTrust > 0) {
         METRICS.validation.tier3_success++;
-        return { validated: true, results, reason: 'exa-good-signal' };
+        return { validated: true, results: checkedResults, reason: "exa-good-signal" };
       }
-      
-      console.log(`\n         🔍 Step 3: Content Verification (GPT check)`);
-      const verified = await verifyContentWithGPT(event, monthName, day, results);
-      
+
+      const verified = await verifyContentWithGPT(event, monthName, day, checkedResults);
+
       if (verified.count >= 1) {
-        console.log(`         ✅✅ EXA + GPT VALIDATION PASSED!`);
-        console.log(`         📝 ${verified.count}/${verified.total} sources confirmed`);
         METRICS.validation.tier3_success++;
-        return { validated: true, results, reason: 'exa-gpt-verified' };
+        return { validated: true, results: checkedResults, reason: "exa-gpt-verified" };
       } else {
         if (attempt < maxRetries - 1) {
           console.log(`         ⚠️ Content verification failed, retrying...`);
@@ -954,27 +940,123 @@ async function validateWithExaIncludeText(event, monthName, day, maxRetries = 3)
           await sleep(1000);
           continue;
         } else {
-          console.log(`         ❌ No sources confirmed after ${maxRetries} attempts - REJECTED`);
           METRICS.validation.tier3_fail++;
-          return { validated: false, results: [], reason: 'exa-gpt-failed' };
+          return { validated: false, results: checkedResults, reason: "exa-gpt-failed" };
         }
       }
-      
-    } catch (err) {
-      lastError = err;
+    } catch (e) {
+      console.log(`         ❌ Exa include_text failed: ${e.message}`);
       if (attempt < maxRetries - 1) {
-        console.log(`         ⚠️ Error: ${err.message}, retrying...`);
         METRICS.validation.tier3_retries++;
         await sleep(1000);
         continue;
+      } else {
+        METRICS.validation.tier3_fail++;
+        return { validated: false, results: [], reason: "exa-error" };
       }
     }
   }
-  
-  console.log(`         ⚠️ All ${maxRetries} attempts failed`);
-  if (lastError) console.log(`         Error: ${lastError.message}`);
-  METRICS.validation.tier3_fail++;
-  return { validated: false, results: [], reason: 'exa-error' };
+}
+
+function applyUniversalSourceCheck(event, results) {
+  if (!Array.isArray(results) || results.length === 0) return results;
+
+  const tokens = extractEventTokens(event);
+  const targetIds = tokens.ids;
+
+  // harter ID-Modus
+  if (targetIds.length > 0) {
+    const exact = [];
+    const neutral = [];
+    const operatorMismatch = [];
+
+    const OPERATOR_DOMAINS = [
+      "blueorigin.com",
+      "www.blueorigin.com",
+      "spacex.com",
+      "www.spacex.com",
+      "nasa.gov",
+      "www.nasa.gov",
+      "esa.int",
+      "www.esa.int",
+    ];
+
+    for (const r of results) {
+      const url = (r.url || "").toLowerCase();
+      const hay = (url + " " + (r.text || "")).toLowerCase();
+      const foundIds = extractIdsFromString(hay);
+
+      const hasTarget = foundIds.some((id) => targetIds.includes(id));
+      const hasOtherId = foundIds.length > 0 && !hasTarget;
+      const isOperator = OPERATOR_DOMAINS.some((d) => url.includes(d));
+
+      if (hasTarget) {
+        exact.push(r);            // perfekte Quelle: ns-36
+      } else if (!hasOtherId) {
+        neutral.push(r);          // keine ID → ok
+      } else if (isOperator) {
+        operatorMismatch.push(r); // blueorigin.com, aber ns-35
+      }
+      // alle anderen mit falscher ID fliegen raus
+    }
+
+    if (exact.length) return exact;
+    if (neutral.length) return neutral;
+    if (operatorMismatch.length) return operatorMismatch;
+    return results;
+  }
+
+  // kein ID-Event → nichts besonderes
+  return results;
+}
+
+function extractEventTokens(event) {
+  const title = event.title || "";
+  const keywords = Array.isArray(event.keywords) ? event.keywords : [];
+
+  const ids = [...title.matchAll(/\b[A-Z]{2,6}-\d{1,4}\b/g)].map((m) => m[0]);    // NS-36, CRS-30, UFC-305
+  const nums = [...title.matchAll(/\b\d{4}\b/g)].map((m) => m[0]);                // 2025, 1999
+  const words = title
+    .replace(/[“”"',.()]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 3)
+    .map((w) => w.toLowerCase());
+
+  return {
+    ids,
+    nums,
+    words,
+    keywords: keywords.map((k) => String(k).toLowerCase()),
+  };
+}
+
+function scoreSourceAgainstTokens(tokens, source) {
+  const url = (source.url || "").toLowerCase();
+  const text = (source.text || "").toLowerCase();
+  let score = 0;
+
+  for (const id of tokens.ids) {
+    const idLow = id.toLowerCase();
+    if (url.includes(idLow) || text.includes(idLow)) score += 50;
+  }
+
+  for (const n of tokens.nums) {
+    if (url.includes(n) || text.includes(n)) score += 15;
+  }
+
+  for (const k of tokens.keywords) {
+    if (!k) continue;
+    if (url.includes(k)) score += 10;
+    else if (text.includes(k)) score += 6;
+  }
+
+  let hits = 0;
+  for (const w of tokens.words) {
+    if (text.includes(w)) hits++;
+  }
+  score += hits * 3;
+
+  return score;
 }
 
 // ---------- Domain Quality Calculation ----------
@@ -1550,6 +1632,131 @@ Return ONLY a valid JSON array with ${needed} scientists.`;
   return [];
 }
 
+// ---------- Strict Keyword-Based Source Filter ----------
+function filterSourcesByKeywords(event, sources) {
+  if (sources.length <= 2) return sources; // Keep all if we have very few
+  
+  console.log(`      🔍 Strict keyword-based source filtering...`);
+  
+  // Extract important keywords from title and existing keywords
+  const titleWords = event.title.toLowerCase()
+    .split(/\s+/)
+    .filter(w => w.length > 3)
+    .filter(w => !['with', 'from', 'that', 'this', 'were', 'have', 'been'].includes(w));
+  
+  const eventKeywords = (event.keywords || []).map(k => k.toLowerCase());
+  const allKeywords = [...titleWords, ...eventKeywords];
+  
+  // Detect if we have numeric IDs (like "NS-36", "2025", "Voyager 1")
+  const hasNumericIDs = allKeywords.some(k => /\d+/.test(k));
+  
+  console.log(`      📋 Keywords: ${allKeywords.slice(0, 8).join(', ')}${allKeywords.length > 8 ? '...' : ''}`);
+  if (hasNumericIDs) {
+    console.log(`      🔢 Numeric IDs detected - using STRICT matching`);
+  }
+  
+  const scored = sources.map(url => {
+    const cached = CONTENTS_CACHE.get(url);
+    if (!cached) return { url, score: 1, foundKeywords: [], strictFail: false }; // Keep uncached with low score
+    
+    const text = (cached.text || "").toLowerCase();
+    if (text.length < 100) return { url, score: 0, foundKeywords: [], strictFail: true }; // Remove very short content
+    
+    let score = 0;
+    const foundKeywords = [];
+    let strictFail = false;
+    
+    for (const keyword of allKeywords) {
+      const kwLower = keyword.toLowerCase();
+      
+      // STRICT CHECK: If keyword contains numbers/IDs, require EXACT match
+      if (/\d+/.test(keyword)) {
+        // Check both with dash and with space (e.g., "ns-36" or "ns 36")
+        const withDash = kwLower;
+        const withSpace = kwLower.replace(/-/g, ' ');
+        const withoutDash = kwLower.replace(/-/g, '');
+        
+        const exactMatch = text.includes(withDash) || 
+                          text.includes(withSpace) || 
+                          text.includes(withoutDash);
+        
+        if (exactMatch) {
+          score += 3; // Higher weight for numeric IDs
+          foundKeywords.push(keyword);
+        } else {
+          // For numeric IDs: if it's a critical ID and not found, mark as strict fail
+          if (eventKeywords.includes(kwLower)) {
+            strictFail = true;
+            if (DEBUG) {
+              console.log(`         ❌ ${url.substring(0, 40)}... missing critical ID: ${keyword}`);
+            }
+          }
+        }
+      } else {
+        // Regular keyword matching
+        if (text.includes(kwLower)) {
+          score++;
+          foundKeywords.push(keyword);
+        }
+      }
+    }
+    
+    // Bonus for high-trust domains
+    const h = host(url);
+    if (HIGH_TRUST_DOMAINS.some(d => h.includes(d) || d.includes(h))) {
+      score += 2;
+    }
+    
+    // If we have numeric IDs and this source failed strict check, set score to 0
+    if (hasNumericIDs && strictFail) {
+      score = 0;
+    }
+    
+    if (DEBUG && score > 0) {
+      console.log(`         ✓ ${url.substring(0, 50)}... → ${score} pts (${foundKeywords.slice(0, 3).join(', ')})`);
+    }
+    
+    return { url, score, foundKeywords, strictFail };
+  });
+  
+  // Sort by score descending
+  scored.sort((a, b) => b.score - a.score);
+  
+  // Keep sources with score > 0 AND at least 2 keyword matches
+  const filtered = scored.filter(s => {
+    if (s.strictFail) return false; // Never keep sources that failed strict check
+    if (s.score === 0) return false;
+    
+    // Require at least 2 keyword matches for sources to be kept
+    return s.foundKeywords.length >= 2;
+  }).map(s => s.url);
+  
+  if (filtered.length >= 2) {
+    const removed = sources.length - filtered.length;
+    if (removed > 0) {
+      console.log(`      🧹 Filtered out ${removed} low-relevance source(s)`);
+      console.log(`      ✅ Kept ${filtered.length} high-quality sources`);
+    }
+    return filtered;
+  }
+  
+  // Fallback: If strict filtering removed everything, keep top 2 sources with ANY keyword matches
+  console.log(`      ⚠️ Strict filtering too aggressive, using fallback...`);
+  const fallback = scored
+    .filter(s => s.score > 0 && s.foundKeywords.length >= 1)
+    .slice(0, 2)
+    .map(s => s.url);
+  
+  if (fallback.length > 0) {
+    console.log(`      📋 Keeping ${fallback.length} sources with at least 1 keyword match`);
+    return fallback;
+  }
+  
+  // Last resort: keep top 2 even if low score
+  console.log(`      ⚠️ No keyword matches found - keeping top 2 sources anyway`);
+  return scored.slice(0, 2).map(s => s.url);
+}
+
 // ---------- Process Event ----------
 async function processEvent(event, monthName, day) {
   console.log(`\n   📌 ${event.title} (${event.year})`);
@@ -1589,25 +1796,8 @@ async function processEvent(event, monthName, day) {
     METRICS.events.enriched++;
   }
   
-  // Filter out obviously wrong sources (no keyword overlap)
-  if (finalSources.length > 2) {
-    const titleWords = event.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
-    const filtered = finalSources.filter(url => {
-      const cached = CONTENTS_CACHE.get(url);
-      if (!cached) return true; // Keep if no content cached yet
-      const text = (cached.text || "").toLowerCase();
-      // Keep if at least 1 important title word appears
-      return titleWords.some(word => text.includes(word));
-    });
-    
-    if (filtered.length >= 2) {
-      const removed = finalSources.length - filtered.length;
-      if (removed > 0) {
-        console.log(`      🧹 Filtered ${removed} irrelevant source(s)`);
-        finalSources = filtered;
-      }
-    }
-  }
+  // Apply improved keyword-based filtering
+  finalSources = filterSourcesByKeywords(event, finalSources);
   
   if (finalSources.length === 0) {
     console.log(`      ✗ No valid sources`);
@@ -1628,7 +1818,9 @@ async function processEvent(event, monthName, day) {
   console.log(`      ✅ ${wordCount} words`);
   
   event.context = polishedContext;
-  event.sources = finalSources.slice(0, 6);
+  event.sources = finalSources.slice(0, 5);  // MAX 5 SOURCES
+  
+  console.log(`      📚 Final sources: ${event.sources.length}`);
   
   METRICS.events.validated++;
   return event;
@@ -1668,7 +1860,7 @@ if (require.main === module) {
   const monthName = new Date(2000, parseInt(month) - 1).toLocaleString("en", { month: "long" });
 
   (async function run() {
-    console.log(`\n🔬 SCIENCE EVENT VALIDATION v7 (Optimized Costs)\n${"=".repeat(70)}`);
+    console.log(`\n🔬 SCIENCE EVENT VALIDATION v7.2 (Strict Keyword Filtering)\n${"=".repeat(70)}`);
     console.log(`📅 ${TEST_DATE} (${monthName} ${parseInt(day)})`);
     console.log(`🎯 ${SCIENCE_CATEGORIES.length} categories`);
     console.log(`🌐 Multilingual date filters enabled`);
@@ -1678,6 +1870,8 @@ if (require.main === module) {
     console.log(`🔧 Year Auto-Correction: ENABLED`);
     console.log(`🔄 Exa 3x Retry: ENABLED`);
     console.log(`💰 Wiki-Check: Only for birthdays/deaths`);
+    console.log(`🔍 STRICT Keyword filtering: ENABLED (exact ID matching)`);
+    console.log(`📚 Max sources: 5`);
     console.log(`${"=".repeat(70)}`);
 
     const all = [];
@@ -1714,12 +1908,12 @@ if (require.main === module) {
     }
 
     const timestamp = Date.now();
-    const file = `science-events-${TEST_DATE}-v7-${timestamp}.json`;
+    const file = `science-events-${TEST_DATE}-v7.2-${timestamp}.json`;
     
     fs.writeFileSync(file, JSON.stringify(all, null, 2));
 
     console.log(`\n${"=".repeat(70)}`);
-    console.log(`📊 QUALITY REPORT v7`);
+    console.log(`📊 QUALITY REPORT v7.2`);
     console.log(`${"=".repeat(70)}`);
     console.log(`Events: ${METRICS.events.seeded} seeded → ${METRICS.events.validated} validated (${METRICS.events.dropped} dropped)`);
     console.log(`Success Rate: ${((METRICS.events.validated / METRICS.events.seeded) * 100).toFixed(1)}%`);
