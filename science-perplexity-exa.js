@@ -1,17 +1,16 @@
-// science-perplexity-exa-optimized-optionB.js — Option B: Perplexity + Exa Fallback
-// Multi-Tier Validation: Wikipedia → Perplexity (Main) → Exa Differential (Fallback)
+// science-perplexity-exa.js — Multi-Tier Validation with Exa include_text
 // Node.js 20+ compatible
 //
 // VALIDATION FLOW:
-// - TIER 0: Wikipedia "On This Day" (free, fast)
-// - TIER 1: Wikipedia Article (free, requires QID)
+// - TIER 0: Wikipedia "On This Day" (free, fast, name-only for birthdays/deaths)
+// - TIER 1: Wikipedia Article (free, requires QID, Portal URLs OK, GPT fallback)
 // - TIER 2: Perplexity Validation (main validator, $0.003/event)
 //   • YES → PASS immediately
 //   • NO (date correct) → Year Auto-Correction
 //   • NO (date wrong) → REJECT
 //   • UNCLEAR → Proceed to Tier 3
-// - TIER 3: Exa Differential (fallback, $0.006/event, only on UNCLEAR)
-// - TIER 4: Content Verification (last resort, only on UNCLEAR)
+// - TIER 3: Exa Search with include_text (date filter, $0.001/event, 3x retry)
+// - TIER 4: Content Verification (GPT-4o-mini check on top results)
 
 const fs = require("fs");
 const https = require("https");
@@ -22,7 +21,6 @@ const PERPLEXITY_API_KEY = process.env.PERPLEXITY_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const EXA_API_KEY = process.env.EXA_API_KEY;
 const DEBUG = !!Number(process.env.DEBUG ?? 0);
-// Option B: Perplexity + Exa Fallback (no GPT Sanity Check)
 
 if (!PERPLEXITY_API_KEY) { console.error("❌ Missing PERPLEXITY_API_KEY"); process.exit(1); }
 if (!OPENAI_API_KEY) { console.error("❌ Missing OPENAI_API_KEY"); process.exit(1); }
@@ -60,7 +58,7 @@ const SCIENCE_CATEGORIES = [
 
 // ---------- Metrics ----------
 let METRICS = {
-  apiCalls: { perplexity: 0, perplexity_validation: 0, openai: 0, openai_mini: 0, exa_search: 0, exa_contents: 0 },
+  apiCalls: { perplexity: 0, perplexity_validation: 0, openai: 0, openai_mini: 0, exa_search: 0, exa_contents: 0, wikidata: 0 },
   costs: { perplexity: 0, openai: 0, exa: 0 },
   events: { seeded: 0, enriched: 0, validated: 0, dropped: 0, fallback: 0 },
   dropReasons: {},
@@ -71,25 +69,25 @@ let METRICS = {
     tier1_success: 0,
     tier1_fail: 0,
     tier1_date_mismatch: 0,
-    tier2_yes: 0,  // Perplexity YES
-    tier2_no: 0,   // Perplexity NO
-    tier2_unclear: 0,  // Perplexity UNCLEAR
+    tier1_gpt_fallback: 0,
+    tier2_yes: 0,
+    tier2_no: 0,
+    tier2_unclear: 0,
     tier2_year_corrected: 0,
-    tier3_success: 0,  // Exa Differential success
+    tier3_success: 0,
     tier3_fail: 0,
-    tier3_uncertain: 0,
-    tier3_falsification_failed: 0,
-    tier3_title_matches: 0,
-    tier4_success: 0,  // Content verification success
+    tier3_retries: 0,
+    tier4_success: 0,
     tier4_fail: 0
   }
 };
 
 // ---------- Global Cache ----------
 const CONTENTS_CACHE = new Map();
-const WIKI_ON_THIS_DAY_CACHE = new Map(); // month-day -> text
-const EXA_SEARCH_CACHE = new Map(); // query -> results
-const PERPLEXITY_VALIDATION_CACHE = new Map(); // event_key -> verdict
+const WIKI_ON_THIS_DAY_CACHE = new Map();
+const EXA_SEARCH_CACHE = new Map();
+const PERPLEXITY_VALIDATION_CACHE = new Map();
+const WIKIDATA_CACHE = new Map();
 
 // ---------- Helpers ----------
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -99,15 +97,78 @@ function host(url) {
   catch { return ""; }
 }
 
-// Parse date from Perplexity's ACTUAL_DATE field (e.g., "October 8, 1975")
+// Extract name from birthday/death titles
+function extractName(title, type) {
+  if (type !== 'birthday' && type !== 'death') return null;
+  
+  // Remove common prefixes
+  let name = title
+    .replace(/^Birth of /i, '')
+    .replace(/^Death of /i, '')
+    .replace(/^Born: /i, '')
+    .replace(/^Died: /i, '')
+    .replace(/'s Birthday$/i, '')
+    .replace(/'s birth$/i, '')
+    .replace(/, pioneer.*/i, '')
+    .replace(/, English.*/i, '')
+    .replace(/, German.*/i, '')
+    .replace(/, American.*/i, '')
+    .replace(/, French.*/i, '')
+    .replace(/, [a-z]+ mathematician.*/i, '')
+    .replace(/, [a-z]+ astronomer.*/i, '')
+    .replace(/, [a-z]+ physicist.*/i, '')
+    .replace(/, [a-z]+ scientist.*/i, '')
+    .replace(/\s*\(\d{4}\)/, '') // Remove year in parentheses
+    .trim();
+  
+  return name;
+}
+
+// Multilingual month names
+const MONTH_TRANSLATIONS = {
+  "January": ["January", "Januar", "Janvier", "Enero", "Gennaio", "1月"],
+  "February": ["February", "Februar", "Février", "Febrero", "Febbraio", "2月"],
+  "March": ["March", "März", "Mars", "Marzo", "Marzo", "3月"],
+  "April": ["April", "April", "Avril", "Abril", "Aprile", "4月"],
+  "May": ["May", "Mai", "Mai", "Mayo", "Maggio", "5月"],
+  "June": ["June", "Juni", "Juin", "Junio", "Giugno", "6月"],
+  "July": ["July", "Juli", "Juillet", "Julio", "Luglio", "7月"],
+  "August": ["August", "August", "Août", "Agosto", "Agosto", "8月"],
+  "September": ["September", "September", "Septembre", "Septiembre", "Settembre", "9月"],
+  "October": ["October", "Oktober", "Octobre", "Octubre", "Ottobre", "10月"],
+  "November": ["November", "November", "Novembre", "Noviembre", "Novembre", "11月"],
+  "December": ["December", "Dezember", "Décembre", "Diciembre", "Dicembre", "12月"]
+};
+
+function getMultilingualDateStrings(monthName, day) {
+  const translations = MONTH_TRANSLATIONS[monthName] || [monthName];
+  const dayNum = parseInt(day);
+  const dayPadded = String(dayNum).padStart(2, '0');
+  
+  const dateStrings = [];
+  
+  for (const month of translations) {
+    dateStrings.push(
+      `${month} ${dayNum}`,
+      `${month} ${dayPadded}`,
+      `${dayNum} ${month}`,
+      `${dayPadded} ${month}`,
+      month.toLowerCase() + ` ${dayNum}`,
+      `${dayNum} ` + month.toLowerCase()
+    );
+  }
+  
+  return uniq(dateStrings);
+}
+
+// Parse date from Perplexity's ACTUAL_DATE field
 function parsePerplexityDate(dateStr) {
   if (!dateStr) return null;
   
-  // Try to parse various date formats
   const patterns = [
-    /(\w+)\s+(\d{1,2}),?\s+(\d{4})/i,  // "October 8, 1975" or "October 8 1975"
-    /(\d{1,2})\s+(\w+),?\s+(\d{4})/i,  // "8 October, 1975"
-    /(\d{4})-(\d{2})-(\d{2})/,         // "1975-10-08"
+    /(\w+)\s+(\d{1,2}),?\s+(\d{4})/i,
+    /(\d{1,2})\s+(\w+),?\s+(\d{4})/i,
+    /(\d{4})-(\d{2})-(\d{2})/,
   ];
   
   for (const pattern of patterns) {
@@ -116,20 +177,16 @@ function parsePerplexityDate(dateStr) {
       let month, day, year;
       
       if (pattern.source.includes('\\w+')) {
-        // Text month format
         if (match[1].match(/^\w+$/)) {
-          // "October 8, 1975"
           month = match[1];
           day = parseInt(match[2]);
           year = parseInt(match[3]);
         } else {
-          // "8 October, 1975"
           day = parseInt(match[1]);
           month = match[2];
           year = parseInt(match[3]);
         }
       } else {
-        // ISO format "1975-10-08"
         year = parseInt(match[1]);
         const monthNum = parseInt(match[2]);
         day = parseInt(match[3]);
@@ -161,28 +218,19 @@ const UGC_BLOCK = [
 ];
 
 const ALLOWED_DOMAINS = [
-  // News
   "bbc.com", "bbc.co.uk", "reuters.com", "apnews.com", "theguardian.com",
   "cnn.com", "nytimes.com", "telegraph.co.uk", "independent.co.uk",
-  // Science Journals & Publications
   "nature.com", "science.org", "sciencemag.org", "cell.com", "thelancet.com",
   "scientificamerican.com", "newscientist.com", "sciencedaily.com",
   "pnas.org", "journals.aps.org", "iopscience.iop.org",
-  // Space Agencies
   "nasa.gov", "esa.int", "spacex.com", "space.com", "planetary.org",
-  // Academic & Research
   "mit.edu", "stanford.edu", "harvard.edu", "ox.ac.uk", "cam.ac.uk",
   "nobelprize.org", "royalsociety.org", "aaas.org",
-  // Medical
   "nih.gov", "cdc.gov", "who.int", "mayoclinic.org", "bmj.com",
-  // Technology
   "ieee.org", "acm.org", "sciencedirect.com", "springer.com",
-  // Historical & Archives (for older events 1700s-1900s)
   "jstor.org", "archive.org", "loc.gov", "biodiversitylibrary.org",
   "historyofinformation.com", "todayinsci.com", "onthisday.com",
-  // Museums & Institutions
   "si.edu", "nhm.ac.uk", "amnh.org", "exploratorium.edu",
-  // General
   "wikipedia.org", "en.wikipedia.org", "britannica.com",
   "smithsonianmag.com", "nationalgeographic.com"
 ];
@@ -195,7 +243,14 @@ const HIGH_TRUST_DOMAINS = [
   "bbc.co.uk", "bbc.com", "reuters.com", "apnews.com",
   "theguardian.com", "nytimes.com",
   "nature.com", "science.org", "cell.com", "thelancet.com",
-  "nasa.gov", "esa.int", "nih.gov", "cdc.gov", "who.int"
+  "nasa.gov", "esa.int", "nih.gov", "cdc.gov", "who.int",
+  "jstor.org", "archive.org", "loc.gov", "todayinsci.com", "onthisday.com"
+];
+
+const HISTORICAL_DOMAINS = [
+  "history.com", "historytoday.com", "britannica.com",
+  "onthisday.com", "todayinsci.com", "historyofinformation.com",
+  "archive.org", "loc.gov", "jstor.org"
 ];
 
 function allowed(url) {
@@ -207,6 +262,28 @@ function hasEuropeanSource(sources) {
   return sources.some(url => {
     const h = host(url);
     return EU_DOMAINS.some(d => h.includes(d));
+  });
+}
+
+function getJSON(hostname, path, headers = {}, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname, port: 443, path, method: "GET",
+      headers: { ...headers }
+    }, res => {
+      let data = ""; res.setEncoding("utf8");
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        let json;
+        try { json = JSON.parse(data); }
+        catch (e) { return reject(new Error(`Parse: ${e.message}`)); }
+        if (res.statusCode >= 400) return reject(new Error(`${hostname} ${res.statusCode}: ${data.slice(0, 200)}`));
+        resolve(json);
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(timeout, () => req.destroy(new Error("Timeout")));
+    req.end();
   });
 }
 
@@ -231,6 +308,44 @@ function postJSON(hostname, path, payload, headers = {}, timeout = 45000) {
     req.setTimeout(timeout, () => req.destroy(new Error("Timeout")));
     req.write(body); req.end();
   });
+}
+
+// ---------- Wikidata API ----------
+async function getWikipediaUrlFromQID(qid) {
+  if (!qid) return null;
+  
+  // Check cache
+  if (WIKIDATA_CACHE.has(qid)) {
+    console.log(`         💾 Wikidata cache hit: ${qid}`);
+    METRICS.cacheHits++;
+    return WIKIDATA_CACHE.get(qid);
+  }
+  
+  try {
+    console.log(`         🌐 Fetching Wikidata: ${qid}`);
+    const json = await getJSON("www.wikidata.org", `/wiki/Special:EntityData/${qid}.json`);
+    
+    METRICS.apiCalls.wikidata++;
+    
+    const entity = json?.entities?.[qid];
+    if (!entity) return null;
+    
+    const enwikiLink = entity.sitelinks?.enwiki;
+    if (!enwikiLink) return null;
+    
+    const title = enwikiLink.title;
+    const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+    
+    console.log(`         ✅ Found Wikipedia URL: ${url}`);
+    
+    // Cache it
+    WIKIDATA_CACHE.set(qid, url);
+    
+    return url;
+  } catch (err) {
+    console.log(`         ⚠️ Wikidata lookup error: ${err.message}`);
+    return null;
+  }
 }
 
 // ---------- Perplexity with Retry ----------
@@ -293,7 +408,6 @@ async function callOpenAI(systemPrompt, userPrompt, temperature = 0.7, maxTokens
 
 // ---------- EXA ----------
 async function exaSearch(query, opts = {}) {
-  // Check cache first
   const cacheKey = JSON.stringify({ query, opts });
   if (EXA_SEARCH_CACHE.has(cacheKey)) {
     console.log(`      💾 Exa cache hit: "${query.substring(0, 50)}..."`);
@@ -306,17 +420,21 @@ async function exaSearch(query, opts = {}) {
     numResults: opts.numResults ?? 15,
     type: "neural",
     useAutoprompt: false,
-    excludeDomains: UGC_BLOCK
+    excludeDomains: UGC_BLOCK,
+    ...(opts.includeText && { text: { includeHtmlTags: false, maxCharacters: 5000 } })
   };
+  
+  if (opts.includeText) {
+    payload.includeText = opts.includeText;
+  }
   
   const json = await postJSON("api.exa.ai", "/search", payload, { "x-api-key": EXA_API_KEY });
   
   METRICS.apiCalls.exa_search++;
-  METRICS.costs.exa += 0.001;
+  METRICS.costs.exa += 0.005;  // $5 per 1k requests
   
   const results = Array.isArray(json?.results) ? json.results : [];
   
-  // Cache the results
   EXA_SEARCH_CACHE.set(cacheKey, results);
   
   return results;
@@ -328,7 +446,7 @@ async function exaContents(ids) {
   const json = await postJSON("api.exa.ai", "/contents", { ids, text: true, format: "markdown" }, { "x-api-key": EXA_API_KEY });
   
   METRICS.apiCalls.exa_contents++;
-  METRICS.costs.exa += ids.length * 0.0001;
+  METRICS.costs.exa += ids.length * 0.001;  // $1 per 1k pages
   
   return Array.isArray(json?.results) ? json.results : [];
 }
@@ -337,7 +455,6 @@ async function exaContents(ids) {
 async function getWikipediaOnThisDay(monthName, day) {
   const cacheKey = `${monthName}_${day}`;
   
-  // Check cache first
   if (WIKI_ON_THIS_DAY_CACHE.has(cacheKey)) {
     console.log(`      💾 Cache hit: Wikipedia ${monthName}_${day} page`);
     METRICS.cacheHits++;
@@ -347,7 +464,6 @@ async function getWikipediaOnThisDay(monthName, day) {
   console.log(`      🌐 Fetching Wikipedia "On This Day" page: ${monthName}_${day}`);
   
   try {
-    // Search for the Wikipedia date page
     const searchQuery = `site:en.wikipedia.org/wiki/${monthName}_${day}`;
     const results = await exaSearch(searchQuery, { numResults: 1 });
     
@@ -356,7 +472,6 @@ async function getWikipediaOnThisDay(monthName, day) {
       return null;
     }
     
-    // Get content
     const contents = await exaContents([results[0].id]);
     if (contents.length === 0) {
       console.log(`      ⚠️ Could not fetch Wikipedia date page content`);
@@ -366,7 +481,6 @@ async function getWikipediaOnThisDay(monthName, day) {
     const text = contents[0].text || "";
     console.log(`      ✅ Wikipedia date page fetched (${text.length} chars)`);
     
-    // Cache it
     WIKI_ON_THIS_DAY_CACHE.set(cacheKey, text);
     
     return text;
@@ -379,6 +493,7 @@ async function getWikipediaOnThisDay(monthName, day) {
 async function validateWithWikipediaOnThisDay(event, monthName, day) {
   console.log(`\n      🔍 TIER 0: Wikipedia "On This Day" Check`);
   console.log(`         Event: ${event.title}`);
+  console.log(`         Type: ${event.type}`);
   console.log(`         Year: ${event.year}`);
   
   const wikiText = await getWikipediaOnThisDay(monthName, day);
@@ -388,18 +503,35 @@ async function validateWithWikipediaOnThisDay(event, monthName, day) {
     return { validated: false, reason: 'wiki-date-page-unavailable' };
   }
   
-  // Search for event in the text
-  // Try multiple search strategies
+  const wikiLower = wikiText.toLowerCase();
+  const yearStr = event.year.toString();
+  
+  // For birthdays/deaths: NAME-ONLY matching
+  if (event.type === 'birthday' || event.type === 'death') {
+    const name = extractName(event.title, event.type);
+    if (name) {
+      console.log(`         👤 Extracted name: "${name}"`);
+      const nameLower = name.toLowerCase();
+      
+      if (wikiLower.includes(nameLower)) {
+        console.log(`         ✅✅ NAME FOUND ON WIKIPEDIA "ON THIS DAY" PAGE!`);
+        METRICS.validation.tier0_success++;
+        return { validated: true, reason: 'wiki-on-this-day-name-confirmed' };
+      } else {
+        console.log(`         ❌ Name not found on Wikipedia date page`);
+      }
+    }
+  }
+  
+  // For events: title or keywords + year
   const searchTerms = [
     event.title,
     ...(event.keywords || []),
-    event.year.toString()
+    yearStr
   ];
   
   let foundMentions = [];
-  const wikiLower = wikiText.toLowerCase();
   
-  // Look for title or keywords + year
   for (const term of searchTerms) {
     if (term && wikiLower.includes(term.toLowerCase())) {
       foundMentions.push(term);
@@ -411,11 +543,7 @@ async function validateWithWikipediaOnThisDay(event, monthName, day) {
     console.log(`         📌 Found: ${foundMentions.join(', ')}`);
   }
   
-  // Check if year is mentioned near the event
-  const yearStr = event.year.toString();
   const hasYear = wikiLower.includes(yearStr);
-  
-  // Need at least title OR 2+ keywords + year
   const titleFound = foundMentions.some(m => m === event.title);
   const keywordCount = foundMentions.filter(m => m !== event.title && m !== yearStr).length;
   
@@ -431,97 +559,170 @@ async function validateWithWikipediaOnThisDay(event, monthName, day) {
   }
 }
 
-// ---------- TIER 2: GPT Sanity Check + Keyword Optimization ----------
-async function validateWithGPTSanityCheck(event, monthName, day) {
-  console.log(`\n      🔍 TIER 2: GPT Sanity Check + Keyword Optimization`);
+// ---------- TIER 1: Wikipedia Article + QID ----------
+async function validateWithWikipediaArticle(event, monthName, day) {
+  console.log(`\n      🔍 TIER 1: Wikipedia Article Validation`);
   console.log(`         Event: ${event.title}`);
-  console.log(`         Date: ${monthName} ${parseInt(day)}, ${event.year}`);
+  console.log(`         Type: ${event.type}`);
+  console.log(`         QID: ${event.qid || 'NONE'}`);
   
-  const prompt = `Evaluate this scientific event:
-
-EVENT: ${event.title}
-DATE: ${monthName} ${parseInt(day)}, ${event.year}
-CONTEXT: ${event.context.substring(0, 200)}...
-
-Task 1: Is this date PLAUSIBLE?
-Answer: PLAUSIBLE / IMPLAUSIBLE / UNCERTAIN
-
-Task 2: If plausible/uncertain, provide 3-5 SPECIFIC search keywords that would uniquely identify this event.
-Use DISTINCTIVE terms (names, places, specific concepts), NOT dates, months, years, or generic words.
-
-Format:
-VERDICT: [your answer]
-KEYWORDS: keyword1, keyword2, keyword3`;
-
+  let wikiSource = (event.sources || []).find(s => 
+    s.includes('wikipedia.org') || s.includes('en.wikipedia.org')
+  );
+  
+  // If no Wikipedia source but QID available, get URL from Wikidata
+  if (!wikiSource && event.qid) {
+    console.log(`         🔍 No Wikipedia source, trying Wikidata lookup...`);
+    wikiSource = await getWikipediaUrlFromQID(event.qid);
+  }
+  
+  if (!wikiSource) {
+    console.log(`         ⚠️ No Wikipedia source - skipping`);
+    return { validated: false, reason: 'no-wiki-source' };
+  }
+  
+  console.log(`         📚 Wikipedia URL: ${wikiSource}`);
+  
+  // Check if it's a Portal/Selected Anniversaries page
+  const isPortalPage = wikiSource.includes('/Portal:') || wikiSource.includes('Selected_anniversaries');
+  if (isPortalPage) {
+    console.log(`         📋 Detected Portal/Selected Anniversaries page`);
+  }
+  
   try {
-    const response = await callOpenAI(
-      "You are a historical fact-checker specializing in science history.",
-      prompt,
-      0.3,
-      100,
-      "gpt-4o-mini"
-    );
-    
-    console.log(`         🤖 GPT Response: ${response.substring(0, 100)}...`);
-    
-    const lines = response.split('\n');
-    const verdictLine = lines.find(l => l.toUpperCase().includes('VERDICT'));
-    const keywordsLine = lines.find(l => l.toUpperCase().includes('KEYWORDS'));
-    
-    let verdict = 'UNCERTAIN';
-    if (verdictLine) {
-      if (verdictLine.toUpperCase().includes('IMPLAUSIBLE')) verdict = 'IMPLAUSIBLE';
-      else if (verdictLine.toUpperCase().includes('PLAUSIBLE')) verdict = 'PLAUSIBLE';
+    const wikiId = wikiSource.match(/wikipedia\.org\/wiki\/([^#?]+)/)?.[1];
+    if (!wikiId) {
+      return { validated: false, reason: 'bad-wiki-url' };
     }
     
-    console.log(`         📊 Verdict: ${verdict}`);
-    
-    if (verdict === 'IMPLAUSIBLE') {
-      console.log(`         ❌ GPT says IMPLAUSIBLE - EVENT REJECTED`);
-      METRICS.validation.tier2_implausible++;
-      return { validated: false, keywords: null, reason: 'gpt-implausible' };
+    const results = await exaSearch(`site:en.wikipedia.org ${wikiId}`, { numResults: 1 });
+    if (results.length === 0) {
+      return { validated: false, reason: 'wiki-not-found' };
     }
     
-    let betterKeywords = null;
-    if (keywordsLine) {
-      const keywordsPart = keywordsLine.split(':')[1]?.trim();
-      if (keywordsPart) {
-        const rawKeywords = keywordsPart.split(',').map(k => k.trim()).filter(k => k.length > 2);
+    const contents = await exaContents([results[0].id]);
+    if (contents.length === 0) {
+      return { validated: false, reason: 'wiki-no-content' };
+    }
+    
+    const wikiText = contents[0].text || "";
+    console.log(`         ✅ Wikipedia article fetched (${wikiText.length} chars)`);
+    
+    CONTENTS_CACHE.set(wikiSource, { text: wikiText, timestamp: Date.now() });
+    
+    const wikiLower = wikiText.toLowerCase();
+    
+    // For Portal pages OR birthdays/deaths: NAME-ONLY matching
+    if (isPortalPage || event.type === 'birthday' || event.type === 'death') {
+      const name = extractName(event.title, event.type);
+      if (name) {
+        console.log(`         👤 Searching for name: "${name}"`);
+        const nameLower = name.toLowerCase();
         
-        // CRITICAL FIX: Filter out dates, months, years from keywords
-        const datePatterns = [
-          /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/i,
-          /\b\d{1,2}\b/,  // day numbers
-          /\b\d{4}\b/,    // years
-          /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i
-        ];
-        
-        betterKeywords = rawKeywords.filter(keyword => {
-          const hasDate = datePatterns.some(pattern => pattern.test(keyword));
-          return !hasDate;
-        });
-        
-        console.log(`         🔑 Optimized keywords (dates filtered): ${betterKeywords.join(', ')}`);
+        if (wikiLower.includes(nameLower)) {
+          console.log(`         ✅✅ NAME FOUND IN WIKIPEDIA ARTICLE!`);
+          METRICS.validation.tier1_success++;
+          return { validated: true, reason: 'wikipedia-article-name-confirmed' };
+        } else {
+          console.log(`         ❌ Name not found in article`);
+        }
       }
     }
     
-    console.log(`         ✅ GPT says ${verdict} - continuing validation`);
-    METRICS.validation.tier2_plausible++;
-    return { validated: null, keywords: betterKeywords, reason: 'gpt-plausible' };
+    // For regular articles: DATE PATTERN matching
+    const monthLower = monthName.toLowerCase();
+    const dayNum = parseInt(day);
+    
+    const datePatterns = [
+      `${monthName} ${dayNum}`,
+      `${monthName} ${day}`,
+      `${dayNum} ${monthName}`,
+      `${day} ${monthName}`,
+      `${monthLower} ${dayNum}`,
+      `${dayNum} ${monthLower}`,
+    ];
+    
+    let dateFound = false;
+    let foundPattern = '';
+    
+    for (const pattern of datePatterns) {
+      const regex = new RegExp(`\\b${pattern.replace(/\s+/g, '\\s+')}\\b`, 'i');
+      if (regex.test(wikiText)) {
+        dateFound = true;
+        foundPattern = pattern;
+        break;
+      }
+    }
+    
+    console.log(`         📅 Date pattern (${monthName} ${dayNum}): ${dateFound ? `✅ (${foundPattern})` : '❌'}`);
+    
+    if (dateFound) {
+      console.log(`         ✅✅ WIKIPEDIA ARTICLE VALIDATION PASSED!`);
+      METRICS.validation.tier1_success++;
+      return { validated: true, reason: 'wikipedia-article-confirmed' };
+    }
+    
+    // GPT FALLBACK for birthdays/deaths (gpt-4o-mini)
+    if (event.type === 'birthday' || event.type === 'death') {
+      console.log(`         🤖 GPT Fallback: Checking with GPT-4o-mini...`);
+      METRICS.validation.tier1_gpt_fallback++;
+      
+      const excerpt = wikiText.substring(0, 1000);
+      const name = extractName(event.title, event.type);
+      const action = event.type === 'birthday' ? 'born' : 'died';
+      
+      const prompt = `Does this Wikipedia article confirm that ${name} was ${action} on ${monthName} ${parseInt(day)}?
+
+ARTICLE EXCERPT:
+${excerpt}
+
+Answer with ONE word only:
+- YES: The article clearly confirms the date
+- NO: The article contradicts or doesn't mention this date
+- UNCLEAR: Cannot determine from this excerpt
+
+Answer:`;
+
+      try {
+        const answer = await callOpenAI(
+          "You are a fact-checker verifying historical dates from Wikipedia articles.",
+          prompt,
+          0.2,
+          10,
+          "gpt-4o-mini"
+        );
+        
+        const answerUpper = answer.toUpperCase().trim();
+        console.log(`         🤖 GPT says: ${answerUpper}`);
+        
+        if (answerUpper.includes('YES')) {
+          console.log(`         ✅✅ GPT CONFIRMS DATE!`);
+          METRICS.validation.tier1_success++;
+          return { validated: true, reason: 'wikipedia-article-gpt-confirmed' };
+        }
+      } catch (err) {
+        console.log(`         ⚠️ GPT fallback error: ${err.message}`);
+      }
+    }
+    
+    console.log(`         ❌ Date not confirmed - EVENT REJECTED`);
+    METRICS.validation.tier1_fail++;
+    METRICS.validation.tier1_date_mismatch++;
+    return { validated: false, reason: 'wiki-date-mismatch' };
     
   } catch (err) {
-    console.log(`         ⚠️ GPT sanity check error: ${err.message}`);
-    return { validated: null, keywords: null, reason: 'gpt-error' };
+    console.log(`         ⚠️ Wikipedia article error: ${err.message}`);
+    METRICS.validation.tier1_fail++;
+    return { validated: false, reason: 'wiki-error' };
   }
 }
 
-// ---------- TIER 2: Perplexity Validator (Main Validator) ----------
+// ---------- TIER 2: Perplexity Validator ----------
 async function validateWithPerplexity(event, monthName, day) {
   console.log(`\n      🔍 TIER 2: Perplexity Date Validator`);
   console.log(`         Event: ${event.title}`);
   console.log(`         Date: ${monthName} ${parseInt(day)}, ${event.year}`);
   
-  // Check cache first
   const cacheKey = `${event.title}_${monthName}_${day}_${event.year}`;
   if (PERPLEXITY_VALIDATION_CACHE.has(cacheKey)) {
     console.log(`         💾 Using cached Perplexity result`);
@@ -553,7 +754,6 @@ Be strict: Only answer YES if you can confirm the exact date with reliable sourc
     
     METRICS.apiCalls.perplexity_validation++;
     
-    // Parse response
     const lines = content.split('\n');
     const verdictLine = lines.find(l => l.toUpperCase().includes('VERDICT'));
     const confidenceLine = lines.find(l => l.toUpperCase().includes('CONFIDENCE'));
@@ -592,10 +792,8 @@ Be strict: Only answer YES if you can confirm the exact date with reliable sourc
     
     const result = { verdict, confidence, actualDate, reason };
     
-    // Cache the result
     PERPLEXITY_VALIDATION_CACHE.set(cacheKey, result);
     
-    // Update metrics
     if (verdict === 'YES') {
       METRICS.validation.tier2_yes++;
       console.log(`         ✅✅ PERPLEXITY CONFIRMS DATE!`);
@@ -629,19 +827,16 @@ async function correctEventYear(event, actualDateStr, reason, monthName, day) {
   
   console.log(`         📅 Parsed: ${actualDate.month} ${actualDate.day}, ${actualDate.year}`);
   
-  // Check if month and day match (only year is wrong)
   if (actualDate.month.toLowerCase() === monthName.toLowerCase() && 
       actualDate.day === parseInt(day)) {
     
     console.log(`         ✅ Month+Day correct (${monthName} ${day}), only YEAR wrong`);
     console.log(`         🔄 Correcting: ${event.year} → ${actualDate.year}`);
     
-    // Update event metadata
     const oldYear = event.year;
     event.year = actualDate.year;
     event.date = `${actualDate.year}-${String(actualDate.monthNum).padStart(2,'0')}-${String(actualDate.day).padStart(2,'0')}`;
     
-    // Ask Perplexity to rewrite context with correct year
     console.log(`         ✍️  Asking Perplexity to rewrite context with correct year...`);
     
     const rewritePrompt = `Rewrite this event description with the correct year.
@@ -682,294 +877,153 @@ Return only the rewritten context:`;
   }
 }
 
-// ---------- TIER 1: Wikipedia Article + QID ----------
-async function validateWithWikipediaArticle(event, monthName, day) {
-  console.log(`\n      🔍 TIER 1: Wikipedia Article Validation`);
+// ---------- TIER 3: Exa Search with include_text ----------
+async function validateWithExaIncludeText(event, monthName, day, maxRetries = 3) {
+  console.log(`\n      🔍 TIER 3: Exa include_text Validation`);
   console.log(`         Event: ${event.title}`);
-  console.log(`         QID: ${event.qid || 'NONE'}`);
+  console.log(`         Date: ${monthName} ${parseInt(day)}, ${event.year}`);
   
-  if (!event.qid) {
-    console.log(`         ⚠️ No QID - skipping article check`);
-    return { validated: false, reason: 'no-qid' };
-  }
+  const keywords = event.keywords || [];
+  const titleWords = event.title.split(' ').filter(w => w.length > 3).slice(0, 5);
+  const allKeywords = [...keywords, ...titleWords];
+  const query = allKeywords.slice(0, 5).join(' ');
   
-  const wikiSource = (event.sources || []).find(s => 
-    s.includes('wikipedia.org') || s.includes('en.wikipedia.org')
-  );
+  const dateStrings = getMultilingualDateStrings(monthName, day);
+  console.log(`         🌐 Multilingual date filters: ${dateStrings.length} variants`);
+  if (DEBUG) console.log(`         📋 Sample filters: ${dateStrings.slice(0, 5).join(', ')}...`);
   
-  if (!wikiSource) {
-    console.log(`         ⚠️ No Wikipedia source - skipping`);
-    return { validated: false, reason: 'no-wiki-source' };
-  }
+  console.log(`         🔎 Query: "${query}"`);
   
-  console.log(`         📚 Wikipedia URL: ${wikiSource}`);
+  let lastError = null;
   
-  try {
-    const wikiId = wikiSource.match(/wikipedia\.org\/wiki\/([^#?]+)/)?.[1];
-    if (!wikiId) {
-      return { validated: false, reason: 'bad-wiki-url' };
-    }
-    
-    const results = await exaSearch(`site:en.wikipedia.org ${wikiId}`, { numResults: 1 });
-    if (results.length === 0) {
-      return { validated: false, reason: 'wiki-not-found' };
-    }
-    
-    const contents = await exaContents([results[0].id]);
-    if (contents.length === 0) {
-      return { validated: false, reason: 'wiki-no-content' };
-    }
-    
-    const wikiText = contents[0].text || "";
-    console.log(`         ✅ Wikipedia article fetched (${wikiText.length} chars)`);
-    
-    // Cache it
-    CONTENTS_CACHE.set(wikiSource, { text: wikiText, timestamp: Date.now() });
-    
-    // Search for date patterns (ONLY month + day, year doesn't matter!)
-    const wikiLower = wikiText.toLowerCase();
-    const monthLower = monthName.toLowerCase();
-    const dayNum = parseInt(day);
-    
-    // Build date patterns for this specific month and day
-    const datePatterns = [
-      `${monthName} ${dayNum}`,       // "October 8"
-      `${monthName} ${day}`,          // "October 08"
-      `${dayNum} ${monthName}`,       // "8 October"
-      `${day} ${monthName}`,          // "08 October"
-      `${monthLower} ${dayNum}`,      // "october 8"
-      `${dayNum} ${monthLower}`,      // "8 october"
-    ];
-    
-    let dateFound = false;
-    let foundPattern = '';
-    
-    for (const pattern of datePatterns) {
-      // Look for the pattern as a whole phrase (not split up)
-      const regex = new RegExp(`\\b${pattern.replace(/\s+/g, '\\s+')}\\b`, 'i');
-      if (regex.test(wikiText)) {
-        dateFound = true;
-        foundPattern = pattern;
-        break;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      console.log(`         🔄 Attempt ${attempt + 1}/${maxRetries}`);
+      
+      const results = await exaSearch(query, { 
+        numResults: 20,
+        includeText: dateStrings,
+        includeTextContent: true
+      });
+      
+      console.log(`         📊 Results: ${results.length}`);
+      
+      if (results.length === 0) {
+        if (attempt < maxRetries - 1) {
+          console.log(`         ⚠️ No results, retrying...`);
+          METRICS.validation.tier3_retries++;
+          await sleep(1000);
+          continue;
+        } else {
+          console.log(`         ❌ No results after ${maxRetries} attempts - REJECTED`);
+          METRICS.validation.tier3_fail++;
+          return { validated: false, results: [], reason: 'exa-no-results' };
+        }
+      }
+      
+      console.log(`         ✅ Step 1: Found ${results.length} results with date filter`);
+      
+      const qualityScore = calculateDomainQuality(results);
+      console.log(`         📊 Domain Quality Score: ${qualityScore.score} points`);
+      console.log(`         🏆 High-Trust: ${qualityScore.highTrust} | 📜 Historical: ${qualityScore.historical}`);
+      
+      if (results.length >= 5 && qualityScore.score >= 3) {
+        console.log(`         ✅✅ STRONG SIGNAL - ${results.length} results + good domains!`);
+        METRICS.validation.tier3_success++;
+        return { validated: true, results, reason: 'exa-strong-signal' };
+      }
+      
+      if (results.length >= 3 && qualityScore.highTrust > 0) {
+        console.log(`         ✅ GOOD SIGNAL - high-trust domain present`);
+        METRICS.validation.tier3_success++;
+        return { validated: true, results, reason: 'exa-good-signal' };
+      }
+      
+      console.log(`\n         🔍 Step 3: Content Verification (GPT check)`);
+      const verified = await verifyContentWithGPT(event, monthName, day, results);
+      
+      if (verified.count >= 1) {
+        console.log(`         ✅✅ EXA + GPT VALIDATION PASSED!`);
+        console.log(`         📝 ${verified.count}/${verified.total} sources confirmed`);
+        METRICS.validation.tier3_success++;
+        return { validated: true, results, reason: 'exa-gpt-verified' };
+      } else {
+        if (attempt < maxRetries - 1) {
+          console.log(`         ⚠️ Content verification failed, retrying...`);
+          METRICS.validation.tier3_retries++;
+          await sleep(1000);
+          continue;
+        } else {
+          console.log(`         ❌ No sources confirmed after ${maxRetries} attempts - REJECTED`);
+          METRICS.validation.tier3_fail++;
+          return { validated: false, results: [], reason: 'exa-gpt-failed' };
+        }
+      }
+      
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries - 1) {
+        console.log(`         ⚠️ Error: ${err.message}, retrying...`);
+        METRICS.validation.tier3_retries++;
+        await sleep(1000);
+        continue;
       }
     }
-    
-    console.log(`         📅 Date pattern (${monthName} ${dayNum}): ${dateFound ? `✅ (${foundPattern})` : '❌'}`);
-    
-    if (dateFound) {
-      console.log(`         ✅✅ WIKIPEDIA ARTICLE VALIDATION PASSED!`);
-      METRICS.validation.tier1_success++;
-      return { validated: true, reason: 'wikipedia-article-confirmed' };
-    } else {
-      console.log(`         ❌ Date pattern not found in article - EVENT REJECTED`);
-      METRICS.validation.tier1_fail++;
-      METRICS.validation.tier1_date_mismatch++;
-      return { validated: false, reason: 'wiki-date-mismatch' };
-    }
-    
-  } catch (err) {
-    console.log(`         ⚠️ Wikipedia article error: ${err.message}`);
-    METRICS.validation.tier1_fail++;
-    return { validated: false, reason: 'wiki-error' };
   }
+  
+  console.log(`         ⚠️ All ${maxRetries} attempts failed`);
+  if (lastError) console.log(`         Error: ${lastError.message}`);
+  METRICS.validation.tier3_fail++;
+  return { validated: false, results: [], reason: 'exa-error' };
 }
 
-// ---------- TIER 3: Enhanced Differential with Natural Language + Title Analysis ----------
-async function validateWithDifferentialQuery(event, monthName, day, optimizedKeywords = null) {
-  console.log(`\n      🔍 TIER 3: Enhanced Differential + Falsification`);
-  console.log(`         Event: ${event.title}`);
-  
-  const keywords = optimizedKeywords || event.keywords || [];
-  if (keywords.length === 0) {
-    console.log(`         ⚠️ No keywords - using title words`);
-    const titleWords = event.title.split(' ').filter(w => w.length > 3).slice(0, 5);
-    keywords.push(...titleWords);
-  }
-  
-  // Generate wrong date (+7 days, handles month overflow)
-  const correctDate = new Date(Date.parse(`${monthName} ${parseInt(day)}, 2000`));
-  const wrongDate = new Date(correctDate);
-  wrongDate.setDate(correctDate.getDate() + 7);
-  const wrongMonthName = wrongDate.toLocaleString("en", { month: "long" });
-  const wrongDay = wrongDate.getDate();
-  
-  // BASE QUERY: Just keywords (no date)
-  const baseQuery = keywords.slice(0, 5).join(' ');
-  
-  // NATURAL LANGUAGE QUERIES with dates
-  const correctNLQuery = `What happened on ${monthName} ${parseInt(day)} ${event.year} ${baseQuery}`;
-  const wrongNLQuery = `What happened on ${wrongMonthName} ${wrongDay} ${event.year} ${baseQuery}`;
-  
-  console.log(`         Query A (baseline): "${baseQuery}"`);
-  console.log(`         Query B (correct NL):  "${correctNLQuery}"`);
-  console.log(`         Query C (wrong NL):    "${wrongNLQuery}"`);
-  
-  try {
-    // Query A: Baseline
-    console.log(`         🔎 Running Query A...`);
-    const resultsA = await exaSearch(baseQuery, { numResults: 15 });
-    const countA = resultsA.length;
-    console.log(`         📊 A (baseline): ${countA}`);
-    
-    if (countA === 0) {
-      console.log(`         ⚠️ No baseline results`);
-      return { validated: false, results: [], reason: 'no-baseline-results' };
-    }
-    
-    await sleep(500);
-    
-    // Query B: Correct date (Natural Language)
-    console.log(`         🔎 Running Query B...`);
-    const resultsB = await exaSearch(correctNLQuery, { numResults: 15 });
-    const countB = resultsB.length;
-    console.log(`         📊 B (correct NL):  ${countB}`);
-    
-    await sleep(500);
-    
-    // Query C: Wrong date (Natural Language - falsification test)
-    console.log(`         🔎 Running Query C...`);
-    const resultsC = await exaSearch(wrongNLQuery, { numResults: 15 });
-    const countC = resultsC.length;
-    console.log(`         📊 C (wrong NL):    ${countC}`);
-    
-    const retentionB = (countB / countA) * 100;
-    const retentionC = (countC / countA) * 100;
-    
-    console.log(`         📈 Retention B (correct): ${retentionB.toFixed(1)}%`);
-    console.log(`         📈 Retention C (wrong):   ${retentionC.toFixed(1)}%`);
-    
-    // TITLE DATE ANALYSIS (NEW!)
-    console.log(`\n         🔍 TITLE DATE ANALYSIS:`);
-    const titleMatchesB = countTitleDateMatches(resultsB, monthName, parseInt(day), event.year);
-    const titleMatchesC = countTitleDateMatches(resultsC, wrongMonthName, wrongDay, event.year);
-    
-    console.log(`         📰 Titles with correct date: ${titleMatchesB}/${countB}`);
-    console.log(`         📰 Titles with wrong date: ${titleMatchesC}/${countC}`);
-    
-    METRICS.validation.tier3_title_matches += titleMatchesB;
-    
-    // DECISION LOGIC
-    
-    // Strong title signal?
-    if (titleMatchesB >= 5 && titleMatchesC === 0) {
-      console.log(`         ✅✅ PASSED - Strong title date matches (${titleMatchesB} vs ${titleMatchesC})`);
-      METRICS.validation.tier3_success++;
-      return { validated: true, results: resultsB, reason: 'title-date-strong' };
-    }
-    
-    if (titleMatchesB >= 3 && titleMatchesC < 2 && titleMatchesB > titleMatchesC * 2) {
-      console.log(`         ✅ PASSED - Good title date signal (${titleMatchesB} vs ${titleMatchesC})`);
-      METRICS.validation.tier3_success++;
-      return { validated: true, results: resultsB, reason: 'title-date-good' };
-    }
-    
-    // FALSIFICATION TEST: Wrong date should perform WORSE than correct date
-    if (retentionC > retentionB) {
-      console.log(`         ❌ REJECTED - Wrong date performs BETTER (${retentionC.toFixed(1)}% > ${retentionB.toFixed(1)}%)`);
-      console.log(`         🚨 This suggests the date is incorrect!`);
-      METRICS.validation.tier3_fail++;
-      METRICS.validation.tier3_falsification_failed++;
-      return { validated: false, results: [], reason: 'differential-falsification-failed' };
-    }
-    
-    // Correct date is better - check retention threshold
-    if (retentionB >= 60 && titleMatchesB > 0) {
-      console.log(`         ✅ PASSED - Correct date strong (${retentionB.toFixed(1)}%), ${titleMatchesB} title matches`);
-      METRICS.validation.tier3_success++;
-      return { validated: true, results: resultsB, reason: 'differential-high' };
-    } else if (retentionB >= 40 && titleMatchesB >= 2) {
-      console.log(`         ✅ PASSED - Moderate retention + title matches`);
-      METRICS.validation.tier3_success++;
-      return { validated: true, results: resultsB, reason: 'differential-moderate-with-titles' };
-    } else if (retentionB >= 40) {
-      console.log(`         ⚠️ Uncertain (40-60%, ${titleMatchesB} title matches) - needs content verification`);
-      return { validated: null, results: resultsB, reason: 'differential-uncertain' };
-    } else {
-      console.log(`         ❌ REJECTED - Low retention (< 40%)`);
-      METRICS.validation.tier3_fail++;
-      return { validated: false, results: [], reason: 'differential-low' };
-    }
-    
-  } catch (err) {
-    console.log(`         ⚠️ Differential query error: ${err.message}`);
-    METRICS.validation.tier3_fail++;
-    return { validated: false, results: [], reason: 'differential-error' };
-  }
-}
-
-// Helper: Count how many titles contain the date
-function countTitleDateMatches(results, monthName, day, year) {
-  if (!results || results.length === 0) return 0;
-  
-  let matches = 0;
-  const monthLower = monthName.toLowerCase();
-  const monthShort = monthName.substring(0, 3).toLowerCase(); // "oct"
-  const dayStr = day.toString();
-  const dayPadded = day.toString().padStart(2, '0'); // "08"
-  const yearStr = year ? year.toString() : null;
-  
-  // Date patterns to look for in titles
-  const patterns = [
-    new RegExp(`\\b${monthName}\\s+${dayStr}\\b`, 'i'),         // "October 8"
-    new RegExp(`\\b${monthName}\\s+${dayPadded}\\b`, 'i'),      // "October 08"
-    new RegExp(`\\b${dayStr}\\s+${monthName}\\b`, 'i'),         // "8 October"
-    new RegExp(`\\b${dayPadded}\\s+${monthName}\\b`, 'i'),      // "08 October"
-    new RegExp(`\\b${monthShort}\\.?\\s+${dayStr}\\b`, 'i'),    // "Oct. 8" or "Oct 8"
-    new RegExp(`\\b${dayStr}\\s+${monthShort}\\b`, 'i'),        // "8 Oct"
-  ];
-  
-  // Add year patterns if year is available
-  if (yearStr) {
-    patterns.push(
-      new RegExp(`\\b${monthName}\\s+${dayStr},?\\s+${yearStr}\\b`, 'i'),  // "October 8, 1958"
-      new RegExp(`\\b${dayStr}\\s+${monthName}\\s+${yearStr}\\b`, 'i'),    // "8 October 1958"
-      new RegExp(`\\b${yearStr}-\\d{2}-${dayPadded}\\b`, 'i')               // "1958-10-08"
-    );
-  }
+// ---------- Domain Quality Calculation ----------
+function calculateDomainQuality(results) {
+  let score = 0;
+  let highTrust = 0;
+  let historical = 0;
   
   for (const result of results) {
-    const title = result.title || "";
     const url = result.url || "";
+    const h = host(url);
     
-    // Check title
-    for (const pattern of patterns) {
-      if (pattern.test(title)) {
-        matches++;
-        if (DEBUG) console.log(`            ✓ Title match: "${title.substring(0, 80)}..."`);
-        break; // Count each result only once
-      }
+    if (HIGH_TRUST_DOMAINS.some(d => h.includes(d) || d.includes(h))) {
+      score += 2;
+      highTrust++;
+      if (DEBUG) console.log(`            ✓ High-trust: ${h}`);
+    } else if (HISTORICAL_DOMAINS.some(d => h.includes(d) || d.includes(h))) {
+      score += 1.5;
+      historical++;
+      if (DEBUG) console.log(`            ✓ Historical: ${h}`);
+    } else if (allowed(url)) {
+      score += 1;
+      if (DEBUG) console.log(`            ✓ Allowed: ${h}`);
     }
   }
   
-  return matches;
+  return { score, highTrust, historical, total: results.length };
 }
 
-// ---------- TIER 4: Content Verification (Last Resort) ----------
-async function validateWithSourceContent(event, monthName, day, differentialResults) {
-  console.log(`\n      🔍 TIER 4: Source Content Verification (Last Resort)`);
-  console.log(`         Event: ${event.title}`);
+// ---------- TIER 4: Content Verification with GPT-4o-mini ----------
+async function verifyContentWithGPT(event, monthName, day, results) {
+  console.log(`         📚 Checking top 3 sources with GPT-4o-mini`);
   
-  const topResults = differentialResults.slice(0, 2);
-  console.log(`         📚 Checking top ${topResults.length} sources`);
-  
+  const topResults = results.slice(0, 3);
   let verifiedCount = 0;
   
   for (let i = 0; i < topResults.length; i++) {
     const result = topResults[i];
     const url = result.url;
     
-    console.log(`         📄 Source ${i + 1}: ${url.substring(0, 50)}...`);
+    console.log(`         📄 Source ${i + 1}: ${url.substring(0, 60)}...`);
     
-    let content;
-    if (CONTENTS_CACHE.has(url)) {
-      console.log(`            💾 Using cached content`);
-      content = CONTENTS_CACHE.get(url).text;
-    } else {
+    let content = result.text || null;
+    
+    if (!content) {
       try {
         const contents = await exaContents([result.id]);
         if (contents.length > 0) {
           content = contents[0].text;
-          CONTENTS_CACHE.set(url, { text: content, timestamp: Date.now() });
         }
       } catch (err) {
         console.log(`            ⚠️ Could not fetch content`);
@@ -1018,55 +1072,44 @@ Answer:`;
     await sleep(300);
   }
   
-  console.log(`         ✅ Verified in ${verifiedCount}/${topResults.length} sources`);
-  
-  if (verifiedCount >= 1) {
-    console.log(`         ✅✅ CONTENT VERIFICATION PASSED!`);
-    METRICS.validation.tier4_success++;
-    return { validated: true, reason: 'source-content-verified' };
-  } else {
-    console.log(`         ❌ No sources confirmed the date - EVENT REJECTED`);
-    METRICS.validation.tier4_fail++;
-    return { validated: false, reason: 'no-source-confirmation' };
-  }
+  return { count: verifiedCount, total: topResults.length };
 }
 
-// ---------- MASTER VALIDATION (OPTION B: Perplexity + Exa Fallback) ----------
+// ---------- MASTER VALIDATION ----------
 async function validateEventReality(event, monthName, day) {
-  console.log(`\n   🛡️ === MULTI-TIER VALIDATION (OPTION B) ===`);
+  console.log(`\n   🛡️ === MULTI-TIER VALIDATION ===`);
   
-  // TIER 0: Wikipedia "On This Day" (Free)
-  const tier0 = await validateWithWikipediaOnThisDay(event, monthName, day);
-  if (tier0.validated === true) {
-    console.log(`      ✅ PASSED (Tier 0: Wikipedia OTD)`);
-    return { valid: true, method: 'tier0-wiki-on-this-day', reason: tier0.reason };
+  // TIER 0: Wikipedia "On This Day" - ONLY for birthdays/deaths (name-matching is fast & cheap)
+  if (event.type === 'birthday' || event.type === 'death') {
+    const tier0 = await validateWithWikipediaOnThisDay(event, monthName, day);
+    if (tier0.validated === true) {
+      console.log(`      ✅ PASSED (Tier 0: Wikipedia OTD)`);
+      return { valid: true, method: 'tier0-wiki-on-this-day', reason: tier0.reason };
+    }
   }
   
-  // TIER 1: Wikipedia Article (Free, requires QID)
-  if (event.qid) {
+  // TIER 1: Wikipedia Article - ONLY for birthdays/deaths with QID
+  if ((event.type === 'birthday' || event.type === 'death') && event.qid) {
     const tier1 = await validateWithWikipediaArticle(event, monthName, day);
     if (tier1.validated === true) {
       console.log(`      ✅ PASSED (Tier 1: Wikipedia Article)`);
       return { valid: true, method: 'tier1-wiki-article', reason: tier1.reason };
     }
-    // If explicit date mismatch, reject immediately
     if (tier1.reason === 'wiki-date-mismatch') {
       console.log(`      ❌ REJECTED (Tier 1: Wikipedia date mismatch)`);
       return { valid: false, method: 'tier1-wiki-article', reason: tier1.reason };
     }
   }
   
-  // TIER 2: Perplexity Validation ($0.003 per event - Main Validator)
+  // TIER 2: Perplexity Validation (for ALL events)
   const tier2 = await validateWithPerplexity(event, monthName, day);
   
   if (tier2.verdict === 'YES') {
-    // Perplexity confirmed - PASS immediately
     console.log(`      ✅ PASSED (Tier 2: Perplexity confirmed)`);
     return { valid: true, method: 'tier2-perplexity', reason: 'perplexity-confirmed' };
   }
   
   if (tier2.verdict === 'NO') {
-    // Check if we can auto-correct the year (month+day correct, only year wrong)
     if (tier2.actualDate) {
       const correction = await correctEventYear(event, tier2.actualDate, tier2.reason, monthName, day);
       
@@ -1076,43 +1119,24 @@ async function validateEventReality(event, monthName, day) {
       }
     }
     
-    // Cannot correct - full date mismatch
     console.log(`      ❌ REJECTED (Tier 2: Perplexity definitive NO)`);
     return { valid: false, method: 'tier2-perplexity', reason: 'perplexity-rejected' };
   }
   
-  // TIER 3: Exa Differential Query (Fallback for UNCLEAR, $0.006)
   if (tier2.verdict === 'UNCLEAR') {
-    console.log(`\n      ⚠️ Perplexity UNCLEAR - proceeding to Exa Differential...`);
+    console.log(`\n      ⚠️ Perplexity UNCLEAR - proceeding to Exa include_text...`);
     
-    const tier3 = await validateWithDifferentialQuery(event, monthName, day, event.keywords);
+    const tier3 = await validateWithExaIncludeText(event, monthName, day, 3);
     
     if (tier3.validated === true) {
-      console.log(`      ✅ PASSED (Tier 3: Exa Differential)`);
-      return { valid: true, method: 'tier3-exa-differential', reason: tier3.reason };
-    }
-    
-    if (tier3.validated === false) {
-      console.log(`      ❌ REJECTED (Tier 3: Exa Differential failed)`);
-      return { valid: false, method: 'tier3-exa-differential', reason: tier3.reason };
-    }
-    
-    // TIER 4: Content Verification (Last Resort, only when Exa is uncertain)
-    if (tier3.validated === null) {
-      console.log(`\n      ⚠️ Exa uncertain - final content check...`);
-      const tier4 = await validateWithSourceContent(event, monthName, day, tier3.results);
-      
-      if (tier4.validated) {
-        console.log(`      ✅ PASSED (Tier 4: Content verified)`);
-        return { valid: true, method: 'tier4-content-verified', reason: tier4.reason };
-      } else {
-        console.log(`      ❌ REJECTED (Tier 4: Content verification failed)`);
-        return { valid: false, method: 'tier4-content-verification', reason: tier4.reason };
-      }
+      console.log(`      ✅ PASSED (Tier 3: Exa include_text + GPT)`);
+      return { valid: true, method: 'tier3-exa-include-text', reason: tier3.reason };
+    } else {
+      console.log(`      ❌ REJECTED (Tier 3: Exa validation failed)`);
+      return { valid: false, method: 'tier3-exa-include-text', reason: tier3.reason };
     }
   }
   
-  // Failed all validation
   console.log(`      ❌ REJECTED (All tiers failed)`);
   return { valid: false, method: 'all-tiers-failed', reason: 'no-validation-passed' };
 }
@@ -1151,7 +1175,7 @@ function extractContextFromSources(event, sources) {
   return snippets.join('\n\n');
 }
 
-// ---------- GPT-4o Polish ----------
+// ---------- GPT-4o Polish (ONLY for final polishing) ----------
 async function polishWithGPT(event, sources, additionalContext = "") {
   const sourcesText = sources.slice(0, 3).map((s, i) => `[${i+1}] ${s}`).join('\n');
   
@@ -1181,12 +1205,35 @@ Guidelines:
 Return only the rewritten text.`;
 
   try {
-    return await callOpenAI(
+    let polished = await callOpenAI(
       "You are a science writer who creates accurate, precise summaries of scientific discoveries and breakthroughs.",
       prompt,
       0.7,
-      300
+      300,
+      "gpt-4o" // ONLY gpt-4o for polishing
     );
+    
+    // Comprehensive UTF-8 encoding fix
+    polished = polished
+      // Common accented characters
+      .replace(/Ã¡/g, 'á').replace(/Ã©/g, 'é').replace(/Ã­/g, 'í').replace(/Ã³/g, 'ó').replace(/Ãº/g, 'ú')
+      .replace(/Ã /g, 'à').replace(/Ã¨/g, 'è').replace(/Ã¬/g, 'ì').replace(/Ã²/g, 'ò').replace(/Ã¹/g, 'ù')
+      .replace(/Ã¢/g, 'â').replace(/Ãª/g, 'ê').replace(/Ã®/g, 'î').replace(/Ã´/g, 'ô').replace(/Ã»/g, 'û')
+      .replace(/Ã¤/g, 'ä').replace(/Ã«/g, 'ë').replace(/Ã¯/g, 'ï').replace(/Ã¶/g, 'ö').replace(/Ã¼/g, 'ü')
+      .replace(/Ã§/g, 'ç').replace(/Ã±/g, 'ñ')
+      .replace(/Ã…/g, 'Å').replace(/Ã/g, 'Ä').replace(/Ã–/g, 'Ö').replace(/Ãœ/g, 'Ü')
+      // Dashes and special characters
+      .replace(/â€"/g, '–').replace(/â€"/g, '—').replace(/â€™/g, "'").replace(/â€˜/g, "'")
+      .replace(/â€œ/g, '"').replace(/â€/g, '"').replace(/â€¦/g, '…')
+      // Degree and other symbols
+      .replace(/Â°/g, '°').replace(/Â±/g, '±').replace(/Â²/g, '²').replace(/Â³/g, '³')
+      .replace(/Âµ/g, 'µ').replace(/Â·/g, '·').replace(/Ã—/g, '×').replace(/Ã·/g, '÷')
+      // Extra spaces
+      .replace(/Â /g, ' ').replace(/\u00A0/g, ' ')
+      // Cleanup any remaining garbage
+      .replace(/Ã‚/g, '').replace(/â€/g, '');
+    
+    return polished;
   } catch (err) {
     if (DEBUG) console.log(`      ⚠️ GPT polish failed: ${err.message}`);
     return event.context;
@@ -1202,11 +1249,17 @@ async function enrichWithEXA(event) {
   const [y, m, d] = dISO.split("-");
   const md = new Date(2000, Number(m) - 1, 1).toLocaleString("en", { month: "long" }) + " " + Number(d);
   
+  // Use exact event title for precision
   const queries = [
-    `"${event.title}" "${md}"`,
-    `"${event.title}" ${event.year}`,
-    `${event.title} (discovery OR breakthrough OR published OR announced)`
+    `"${event.title}" "${md}"`,  // Exact title + date
+    `"${event.title}" ${event.year}`,  // Exact title + year
   ];
+  
+  // Only add broader search for very recent events (< 1 year old)
+  const isVeryRecent = event.year >= new Date().getFullYear();
+  if (isVeryRecent) {
+    queries.push(`${event.title} (discovery OR breakthrough OR published OR announced)`);
+  }
   
   const hits = [];
   for (const q of queries) {
@@ -1328,14 +1381,25 @@ async function seedCategory(category, monthName, day) {
         const titleLower = (e.title || "").toLowerCase();
         const contextLower = (e.context || "").toLowerCase();
         
-        // APOD Filter - reject featured images that are not discoveries
+        // Filter out Perplexity error responses
+        const errorPhrases = [
+          'search results do not', 'do not provide', 'no significant',
+          'no major', 'no globally significant', 'no events found',
+          'unable to find', 'not provide', 'hypothetical', 'fictional', 'imaginary'
+        ];
+        
+        if (errorPhrases.some(phrase => titleLower.includes(phrase) || contextLower.includes(phrase))) {
+          if (DEBUG) console.log(`      ⚠️ Filtering Perplexity error response: ${e.title}`);
+          return false;
+        }
+        
+        // Filter out APOD features
         const apodKeywords = [
           'apod', 'astronomy picture of the day', 'picture of the day',
           'featured on apod', 'image of the day', 'astronomical image of'
         ];
         
         if (apodKeywords.some(keyword => titleLower.includes(keyword) || contextLower.includes(keyword))) {
-          // Check if it's a legitimate "first image" discovery
           const legitimateImageKeywords = [
             'first image', 'first light', 'first observation',
             'first photograph', 'first direct image', 'discovery image'
@@ -1349,16 +1413,6 @@ async function seedCategory(category, monthName, day) {
             if (DEBUG) console.log(`      ⚠️ Filtering out APOD feature: ${e.title}`);
             return false;
           }
-        }
-        
-        const errorPhrases = [
-          'no globally significant', 'no major', 'search results do not',
-          'no significant', 'not provide', 'no events found', 'unable to find',
-          'hypothetical', 'fictional', 'imaginary'
-        ];
-        
-        if (errorPhrases.some(phrase => titleLower.includes(phrase) || contextLower.includes(phrase))) {
-          return false;
         }
         
         if (!e.title || e.title.length < 10) return false;
@@ -1407,12 +1461,14 @@ async function seedCategory(category, monthName, day) {
 }
 
 // ---------- Birthdays/Deaths Fallback ----------
-async function seedBirthdaysDeaths(category, needed, monthName, day) {
-  console.log(`\n   🎂 Fallback: Birthdays/Deaths for ${category.name}`);
+async function seedBirthdaysDeaths(needed, monthName, day) {
+  console.log(`\n   🎂 Fallback: Birthdays/Deaths of World-Changing Scientists`);
   
-  const prompt = `Find ${needed} significant births or deaths of scientists who made important contributions on ${monthName} ${parseInt(day)} (any year).
+  const prompt = `Find ${needed} births or deaths of scientists who fundamentally changed the world on ${monthName} ${parseInt(day)} (any year).
 
-FOCUS: Scientists who contributed to ${category.description}
+FOCUS: Scientists whose work had MASSIVE impact on humanity - Nobel laureates, breakthrough discoverers, field founders.
+
+Examples: Einstein, Darwin, Curie, Newton, Pasteur, Tesla, Feynman, Hawking.
 
 For each person provide:
 {
@@ -1422,12 +1478,12 @@ For each person provide:
   "category": "science",
   "type": "birthday | death",
   "qid": "Wikidata QID or null",
-  "context": "Brief biography focusing on scientific contributions (80-100 words)",
+  "context": "Brief biography focusing on world-changing contributions (80-100 words)",
   "sources": ["URL1", "URL2"],
   "keywords": ["keyword1", "keyword2"]
 }
 
-Return ONLY a valid JSON array.`;
+Return ONLY a valid JSON array with ${needed} scientists.`;
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -1477,7 +1533,7 @@ Return ONLY a valid JSON array.`;
       }
       
       METRICS.events.seeded += validEvents.length;
-      console.log(`   ✅ Found ${validEvents.length} birthday(s)/death(s)`);
+      console.log(`   ✅ Found ${validEvents.length} scientist(s)`);
       
       return validEvents.slice(0, needed);
       
@@ -1501,7 +1557,6 @@ async function processEvent(event, monthName, day) {
   console.log(`      QID: ${event.qid || 'NONE'}`);
   console.log(`      Sources: ${(event.sources || []).length}`);
   
-  // MULTI-TIER VALIDATION
   const validation = await validateEventReality(event, monthName, day);
   
   if (!validation.valid) {
@@ -1517,10 +1572,13 @@ async function processEvent(event, monthName, day) {
   console.log(`         Method: ${validation.method}`);
   console.log(`         Reason: ${validation.reason}`);
   
-  // Enrichment
   const perplexitySources = (event.sources || []).filter(s => s && allowed(s));
+  const contextWordCount = (event.context || "").split(/\s+/).length;
+  
+  // Enrich if: (1) too few sources, (2) no EU source, or (3) context too short
   const needsEnrichment = perplexitySources.length < 2 || 
-    (perplexitySources.length < 3 && !hasEuropeanSource(perplexitySources));
+    (perplexitySources.length < 3 && !hasEuropeanSource(perplexitySources)) ||
+    contextWordCount < 70;
   
   let finalSources = perplexitySources;
   
@@ -1531,6 +1589,26 @@ async function processEvent(event, monthName, day) {
     METRICS.events.enriched++;
   }
   
+  // Filter out obviously wrong sources (no keyword overlap)
+  if (finalSources.length > 2) {
+    const titleWords = event.title.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+    const filtered = finalSources.filter(url => {
+      const cached = CONTENTS_CACHE.get(url);
+      if (!cached) return true; // Keep if no content cached yet
+      const text = (cached.text || "").toLowerCase();
+      // Keep if at least 1 important title word appears
+      return titleWords.some(word => text.includes(word));
+    });
+    
+    if (filtered.length >= 2) {
+      const removed = finalSources.length - filtered.length;
+      if (removed > 0) {
+        console.log(`      🧹 Filtered ${removed} irrelevant source(s)`);
+        finalSources = filtered;
+      }
+    }
+  }
+  
   if (finalSources.length === 0) {
     console.log(`      ✗ No valid sources`);
     METRICS.events.dropped++;
@@ -1538,15 +1616,12 @@ async function processEvent(event, monthName, day) {
     return null;
   }
   
-  // Context enrichment
   let additionalContext = "";
-  const contextWordCount = (event.context || "").split(/\s+/).length;
   if (contextWordCount < 80) {
     console.log(`      📚 Context short (${contextWordCount} words)`);
     additionalContext = extractContextFromSources(event, finalSources);
   }
   
-  // Polish with GPT
   console.log(`      ✍️  Polishing text...`);
   const polishedContext = await polishWithGPT(event, finalSources, additionalContext);
   const wordCount = polishedContext.split(/\s+/).length;
@@ -1573,26 +1648,6 @@ async function fetchCategory(category, monthName, day) {
   
   console.log(`   ✅ Validated ${processed.length}/${category.count}`);
   
-  // Fallback
-  if (processed.length < category.count) {
-    const needed = category.count - processed.length;
-    console.log(`   ⚠️ Need ${needed} more event(s), trying birthdays/deaths...`);
-    
-    const fallbackEvents = await seedBirthdaysDeaths(category, needed, monthName, day);
-    
-    for (const event of fallbackEvents) {
-      if (processed.length >= category.count) break;
-      const result = await processEvent(event, monthName, day);
-      if (result) {
-        processed.push(result);
-        METRICS.events.fallback++;
-      }
-      await sleep(500);
-    }
-    
-    console.log(`   ✅ Final count: ${processed.length}/${category.count}`);
-  }
-  
   return processed.slice(0, category.count);
 }
 
@@ -1613,12 +1668,16 @@ if (require.main === module) {
   const monthName = new Date(2000, parseInt(month) - 1).toLocaleString("en", { month: "long" });
 
   (async function run() {
-    console.log(`\n🔬 SCIENCE EVENT TEST v4 (Year Auto-Correct + APOD Filter)\n${"=".repeat(70)}`);
+    console.log(`\n🔬 SCIENCE EVENT VALIDATION v7 (Optimized Costs)\n${"=".repeat(70)}`);
     console.log(`📅 ${TEST_DATE} (${monthName} ${parseInt(day)})`);
     console.log(`🎯 ${SCIENCE_CATEGORIES.length} categories`);
-    console.log(`🤖 GPT Sanity Check: ${USE_GPT_SANITY_CHECK ? 'ENABLED' : 'DISABLED'}`);
+    console.log(`🌐 Multilingual date filters enabled`);
+    console.log(`👤 Name-only matching for birthdays/deaths`);
+    console.log(`🔗 QID → Wikidata → Real Wikipedia URL`);
+    console.log(`🤖 GPT-4o-mini for validation, GPT-4o for polishing`);
     console.log(`🔧 Year Auto-Correction: ENABLED`);
-    console.log(`🖼️  APOD Filtering: ENABLED`);
+    console.log(`🔄 Exa 3x Retry: ENABLED`);
+    console.log(`💰 Wiki-Check: Only for birthdays/deaths`);
     console.log(`${"=".repeat(70)}`);
 
     const all = [];
@@ -1628,7 +1687,25 @@ if (require.main === module) {
       await sleep(2000);
     }
 
-    // Convert date format
+    const TARGET_TOTAL = 7;
+    if (all.length < 5) {
+      console.log(`\n⚠️ Only ${all.length} events validated - adding birthdays/deaths fallback...`);
+      const needed = Math.min(TARGET_TOTAL - all.length, 5);
+      
+      const fallbackEvents = await seedBirthdaysDeaths(needed, monthName, day);
+      
+      for (const event of fallbackEvents) {
+        const result = await processEvent(event, monthName, day);
+        if (result) {
+          all.push(result);
+          METRICS.events.fallback++;
+        }
+        await sleep(500);
+      }
+      
+      console.log(`   ✅ Added ${METRICS.events.fallback} fallback event(s)`);
+    }
+
     for (const event of all) {
       if (event.date && event.date.match(/^\d{4}-\d{2}-\d{2}$/)) {
         const [year, month, day] = event.date.split('-');
@@ -1637,32 +1714,31 @@ if (require.main === module) {
     }
 
     const timestamp = Date.now();
-    const file = `science-events-${TEST_DATE}-v4-${timestamp}.json`;
+    const file = `science-events-${TEST_DATE}-v7-${timestamp}.json`;
     
     fs.writeFileSync(file, JSON.stringify(all, null, 2));
 
     console.log(`\n${"=".repeat(70)}`);
-    console.log(`📊 QUALITY REPORT v4 (Year Auto-Correct + APOD Filter)`);
+    console.log(`📊 QUALITY REPORT v7`);
     console.log(`${"=".repeat(70)}`);
     console.log(`Events: ${METRICS.events.seeded} seeded → ${METRICS.events.validated} validated (${METRICS.events.dropped} dropped)`);
     console.log(`Success Rate: ${((METRICS.events.validated / METRICS.events.seeded) * 100).toFixed(1)}%`);
+    console.log(`Fallback Events: ${METRICS.events.fallback}`);
     
     console.log(`\nValidation Breakdown:`);
     console.log(`  Tier 0 (Wiki "On This Day"): ${METRICS.validation.tier0_success} ✅ / ${METRICS.validation.tier0_fail} ❌`);
     console.log(`  Tier 1 (Wiki Article): ${METRICS.validation.tier1_success} ✅ / ${METRICS.validation.tier1_fail} ❌ (${METRICS.validation.tier1_date_mismatch} mismatches)`);
-    if (USE_GPT_SANITY_CHECK) {
-      console.log(`  Tier 2 (GPT Sanity): ${METRICS.validation.tier2_implausible} IMPLAUSIBLE / ${METRICS.validation.tier2_plausible} PLAUSIBLE`);
+    if (METRICS.validation.tier1_gpt_fallback > 0) {
+      console.log(`     └─> GPT Fallback: ${METRICS.validation.tier1_gpt_fallback} 🤖`);
     }
-    console.log(`  Tier 3 (Perplexity): ${METRICS.validation.tier3_yes} YES / ${METRICS.validation.tier3_no} NO / ${METRICS.validation.tier3_unclear} UNCLEAR`);
-    if (METRICS.validation.tier3_year_corrected > 0) {
-      console.log(`     └─> Year Auto-Corrected: ${METRICS.validation.tier3_year_corrected} 🔧`);
+    console.log(`  Tier 2 (Perplexity): ${METRICS.validation.tier2_yes} YES / ${METRICS.validation.tier2_no} NO / ${METRICS.validation.tier2_unclear} UNCLEAR`);
+    if (METRICS.validation.tier2_year_corrected > 0) {
+      console.log(`     └─> Year Auto-Corrected: ${METRICS.validation.tier2_year_corrected} 🔧`);
     }
-    console.log(`  Tier 4 (Differential+Titles): ${METRICS.validation.tier4_success} ✅ / ${METRICS.validation.tier4_fail} ❌`);
-    console.log(`     └─> Title Matches Found: ${METRICS.validation.tier4_title_matches}`);
-    if (METRICS.validation.tier4_falsification_failed > 0) {
-      console.log(`     └─> Falsification Failed: ${METRICS.validation.tier4_falsification_failed} 🚨`);
+    console.log(`  Tier 3 (Exa include_text): ${METRICS.validation.tier3_success} ✅ / ${METRICS.validation.tier3_fail} ❌`);
+    if (METRICS.validation.tier3_retries > 0) {
+      console.log(`     └─> Retries: ${METRICS.validation.tier3_retries} 🔄`);
     }
-    console.log(`  Tier 5 (Content Verification): ${METRICS.validation.tier5_success} ✅ / ${METRICS.validation.tier5_fail} ❌`);
     
     if (Object.keys(METRICS.dropReasons).length > 0) {
       console.log(`\nDrop Reasons:`);
@@ -1676,6 +1752,7 @@ if (require.main === module) {
     console.log(`  - OpenAI (gpt-4o-mini): ${METRICS.apiCalls.openai_mini}`);
     console.log(`  - Exa Search: ${METRICS.apiCalls.exa_search}`);
     console.log(`  - Exa Contents: ${METRICS.apiCalls.exa_contents}`);
+    console.log(`  - Wikidata: ${METRICS.apiCalls.wikidata}`);
     console.log(`  - Cache Hits: ${METRICS.cacheHits}`);
     
     console.log(`\nEstimated Costs:`);
